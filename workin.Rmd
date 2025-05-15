@@ -1,0 +1,254 @@
+---
+title: "workit"
+author: "Tatiana Voronova"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(texreg)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(modelsummary)
+library(readr)
+library(lubridate)
+library(gt)
+library(purrr)
+library(fixest)
+```
+
+```{r}
+setwd("C:/r/data/final_dataset/final_region")
+df <- read_csv("C:/r/data/final_dataset/final_region/df.csv") 
+
+df <- df %>% 
+  mutate(
+    war = as.integer(date >= as.Date("2022-04-01")),
+    month = factor(month(date, label = TRUE, abbr = TRUE)))
+
+df <- df[df$date <= as.Date("2023-12-01"), ]
+
+
+```
+```{r}
+# Calculate nationwide rent and general CPI inflation (monthly % change)
+df <- df %>%
+  arrange(date) %>%
+  mutate(
+    rent_cpi = 100 * (log(rent_cpi) - log(lag(rent_cpi))),
+    total_cpi = 100 * (log(total_cpi) - log(lag(total_cpi)))
+  )
+
+
+```
+
+
+
+## Seasonality 
+
+```{r}
+# quick seasonality check (optional)
+season_rent <- lm(rent_cpi ~ month, data = df)
+season_cpi <- lm(total_cpi ~ month, data = df)
+
+screenreg(list(season_rent, season_cpi))
+
+
+
+```
+
+
+## Basic OLS
+
+```{r}
+
+m1 <- lm(rent_cpi ~ war, data = df)
+m2 <- lm(rent_cpi ~ war + total_cpi, data = df)
+m3 <- lm(rent_cpi ~ war + total_cpi + interest_rate, data = df)
+
+screenreg(list(m1, m2, m3))
+
+
+
+
+rent_table <- modelsummary(
+  list(
+    "Rent CPI"      = m1,
+    "Rent CPI"   = m2,
+    "Rent CPI"   = m3
+  ),
+  output = "gt",
+  title = "OLS Models for Rent CPI",
+  stars = TRUE,
+  fmt = "%.2f",
+  depvar = "Rents",  
+  coef_rename = c(
+    "war" = "War",
+    "total_cpi" = "CPI",
+    "interest_rate" = "Interest Rate"
+  ),
+  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance|Residual Std. Error"
+)
+
+gtsave(rent_table, "C:/r/data/final_dataset/final_region/rent_ols_nation.png")
+
+
+
+```
+
+
+## Panel
+```{r}
+
+panel <- df %>%
+  select(date, war, interest_rate,
+         matches("^(Tbilisi|Kutaisi|Batumi|Gori|Telavi|Zugdidi)_(CPI|Rent)$")) %>%
+  pivot_longer(
+    cols = -c(date, war, interest_rate),
+    names_to = c("city", "variable"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  pivot_wider(names_from = variable, values_from = value) %>%
+  mutate(
+    city = factor(city),
+    date = as.Date(date)
+  )
+
+```
+
+
+```{r}
+# Ensure 'city' is a factor with consistent levels
+panel <- panel %>% 
+  mutate(city = factor(city)) %>%
+  arrange(city)
+
+# Get a correctly ordered vector of city names
+cities <- panel %>% 
+  distinct(city) %>% 
+  pull(city) %>% 
+  as.character()
+
+# Run OLS for each city with correctly named models
+rent_models <- panel %>%
+  group_split(city) %>%
+  setNames(cities) %>%
+  map(~ lm(Rent ~ war + CPI + interest_rate, data = .x))
+
+# Create model summary table
+rent_city <- modelsummary(
+  rent_models,
+  title = "OLS: Rent Regressions by City",
+  stars = TRUE,
+  fmt = "%.2f",
+  coef_rename = c(
+    "war" = "War",
+    "CPI" = "Inflation",
+    "interest_rate" = "Interest Rate"
+  ),
+  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance",
+  output = "gt"
+)
+
+# Save the output table
+gtsave(rent_city, "C:/r/data/final_dataset/final_region/rent_city.png")
+
+
+```
+
+
+```{r}
+
+
+# TWFE model: Rent ~ war (interacted with city) + controls | city FE + time FE
+twfe_model <- feols(
+  Rent ~ i(city, war, ref = "Tbilisi") + CPI | city + date,
+  data = panel
+)
+ 
+
+
+twfe <- modelsummary(
+  twfe_model,
+  output = "gt",
+  title = "TWFE: Cities after April 2022 (vs. Tbilisi)",
+  stars = TRUE,
+  fmt = "%.2f",
+  coef_map = c(
+    "city::Batumi:war"   = "Batumi vs. Tbilisi",
+    "city::Gori:war"     = "Gori vs. Tbilisi",
+    "city::Kutaisi:war"  = "Kutaisi vs. Tbilisi",
+    "city::Telavi:war"   = "Telavi vs. Tbilisi",
+    "city::Zugdidi:war"  = "Zugdidi vs. Tbilisi"
+  ),
+  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Std.Errors|FE|Within|^R2 Within|^R2 Within Adj",
+)
+
+gtsave(twfe, "C:/r/data/final_dataset/final_region/twfe.png")
+```
+
+
+```{r}
+library(ggplot2)
+
+
+# Step 1: Create log variable
+df <- df %>%
+  mutate(log_transfers_rus = log(transfers_rus))
+
+# Step 2: Get scaling parameters
+range_rent <- range(df$rent_cpi, na.rm = TRUE)
+range_log <- range(df$log_transfers_rus, na.rm = TRUE)
+
+# Manual scaling
+scale_factor <- diff(range_rent) / diff(range_log)
+offset <- range_rent[1] - range_log[1] * scale_factor
+
+# Step 3: Plot
+rent_transfers <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = rent_cpi, color = "Rent CPI"), size = 1) +
+  geom_line(aes(y = log_transfers_rus * scale_factor + offset, color = "Log(Transfers from Russia)"), 
+            size = 1, linetype = "dashed") +
+  scale_y_continuous(
+    name = "Rent CPI",
+    sec.axis = sec_axis(
+      trans = ~ (. - offset) / scale_factor,
+      name = "Log(Transfers from Russia)"
+    )
+  ) +
+  scale_color_manual(values = c("Rent CPI" = "blue", "Log(Transfers from Russia)" = "red")) +
+  labs(
+    title = "Figure 1: Rent CPI and Money Transfers from Russia 2015-2023",
+    x = "Date",
+    color = "Variable"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.y.left = element_text(color = "blue"),
+    axis.title.y.right = element_text(color = "red")
+  )
+
+
+ggsave("C:/r/data/final_dataset/final_region/rents_transfers.png", plot = rent_transfers, width = 8, height = 6, dpi = 300)
+
+```
+
+
+
+```{r}
+# Filter the panel for Tbilisi only
+tbilisi_data <- panel %>% filter(city == "Tbilisi")
+
+# Run the OLS model for Tbilisi
+tbilisi_model <- lm(Rent ~ war + CPI + interest_rate, data = tbilisi_data)
+
+# Summarize the model
+summary(tbilisi_model)
+
+```
+
+
