@@ -17,9 +17,18 @@ library(lubridate)
 library(gt)
 library(purrr)
 library(fixest)
+library(patchwork)
+library(ggplot2)
+library(forecast)
+library(sandwich)
+library(lmtest)
+
 ```
 
-```{r}
+
+# SET UP
+
+```{r set up again}
 setwd("C:/r/data/final_dataset/final_region")
 df <- read_csv("C:/r/data/final_dataset/final_region/df.csv") 
 
@@ -28,89 +37,112 @@ df <- df %>%
     war = as.integer(date >= as.Date("2022-04-01")),
     month = factor(month(date, label = TRUE, abbr = TRUE)))
 
-df <- df[df$date <= as.Date("2023-12-01"), ]
-
-
 ```
-```{r}
+## Creating rates
+
+
+```{r creating rates}
 # Calculate nationwide rent and general CPI inflation (monthly % change)
+
 df <- df %>%
   arrange(date) %>%
-  mutate(
-    rent_cpi = 100 * (log(rent_cpi) - log(lag(rent_cpi))),
-    total_cpi = 100 * (log(total_cpi) - log(lag(total_cpi)))
-  )
-
+  mutate(across(
+    .cols = c(rent_cpi, total_cpi,
+              Tbilisi_CPI, Kutaisi_CPI, Batumi_CPI, Gori_CPI, Telavi_CPI, Zugdidi_CPI,
+              Tbilisi_Rent, Kutaisi_Rent, Batumi_Rent, Gori_Rent, Telavi_Rent, Zugdidi_Rent),
+    .fns = ~ 100 * (. - lag(.)) / lag(.),
+    .names = "{.col}_rate"
+  ))
 
 ```
 
+## Visual for rent cumulative and monthly inflation rent
 
+```{r}
+
+# Plot 1: Rent index over time
+p1 <- ggplot(df, aes(x = date, y = rent_cpi)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_vline(xintercept = as.Date("2022-05-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-11-01"), linetype = "dashed", color = "black") +
+  labs(
+    title = "Nationwide Rent Index (CPI)",
+    x = "Date",
+    y = "Rent CPI Index"
+  ) +
+  theme_minimal()
+
+# Plot 2: Monthly rent inflation (% change)
+p2 <- ggplot(df, aes(x = date, y = rent_cpi_rate)) +
+  geom_line(color = "firebrick", size = 1) +
+  geom_vline(xintercept = as.Date("2022-05-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-11-01"), linetype = "dashed", color = "black") +
+  labs(
+    title = "Nationwide Monthly Rent Inflation (%)",
+    x = "Date",
+    y = "Monthly Rent CPI Change (%)"
+  ) +
+  theme_minimal()
+
+# Show plots side by side (if using patchwork)
+p1
+p2
+
+ggsave("C:/r/data/final_dataset/final_region/rent_cum_plot.png", plot = p1, width = 8, height = 6, dpi = 300)
+
+ggsave("C:/r/data/final_dataset/final_region/rent_rate_plot.png", plot = p2, width = 8, height = 6, dpi = 300)
+```
+
+
+# ANALYSIS
+```{r correcting period}
+df <- df[df$date <= as.Date("2023-12-01") & df$date > as.Date("2015-10-01"), ]
+```
 
 ## Seasonality 
 
-```{r}
-# quick seasonality check (optional)
-season_rent <- lm(rent_cpi ~ month, data = df)
-season_cpi <- lm(total_cpi ~ month, data = df)
+```{r seasonality checks}
 
-screenreg(list(season_rent, season_cpi))
+# for monthly rates
+season_rent_rate <- lm(rent_cpi_rate ~ month, data = df)
+season_cpi_rate <- lm(total_cpi_rate ~ month, data = df)
+
+#screenreg(list(season_rent, season_cpi, season_rent_rate, season_cpi_rate))
+
+```
 
 
 
+```{r monthly rates}
+m4 <- lm(rent_cpi_rate ~ war, data = df)
+m5 <- lm(rent_cpi_rate ~ war + total_cpi_rate, data = df)
+m6 <- lm(rent_cpi_rate ~ war + total_cpi_rate + interest_rate, data = df)
+
+screenreg(list(m4, m5, m6))
 ```
 
 
-## Basic OLS
-
-```{r}
-
-m1 <- lm(rent_cpi ~ war, data = df)
-m2 <- lm(rent_cpi ~ war + total_cpi, data = df)
-m3 <- lm(rent_cpi ~ war + total_cpi + interest_rate, data = df)
-
-screenreg(list(m1, m2, m3))
-
-
-
-
-rent_table <- modelsummary(
-  list(
-    "Rent CPI"      = m1,
-    "Rent CPI"   = m2,
-    "Rent CPI"   = m3
-  ),
-  output = "gt",
-  title = "OLS Models for Rent CPI",
-  stars = TRUE,
-  fmt = "%.2f",
-  depvar = "Rents",  
-  coef_rename = c(
-    "war" = "War",
-    "total_cpi" = "CPI",
-    "interest_rate" = "Interest Rate"
-  ),
-  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance|Residual Std. Error"
-)
-
-gtsave(rent_table, "C:/r/data/final_dataset/final_region/rent_ols_nation.png")
-
-
-
-```
 
 
 ## Panel
-```{r}
+
+### Set Up
+
+```{r pivoting the table}
 
 panel <- df %>%
   select(date, war, interest_rate,
-         matches("^(Tbilisi|Kutaisi|Batumi|Gori|Telavi|Zugdidi)_(CPI|Rent)$")) %>%
+         matches("^(Tbilisi|Kutaisi|Batumi|Gori|Telavi|Zugdidi)_(CPI|Rent)(_rate)?$")) %>%
   pivot_longer(
     cols = -c(date, war, interest_rate),
-    names_to = c("city", "variable"),
+    names_to = c("city", "variable", "rate"),
     names_sep = "_",
     values_to = "value"
   ) %>%
+  mutate(
+    variable = ifelse(is.na(rate), variable, paste0(variable, "_rate"))
+  ) %>%
+  select(-rate) %>%
   pivot_wider(names_from = variable, values_from = value) %>%
   mutate(
     city = factor(city),
@@ -120,7 +152,8 @@ panel <- df %>%
 ```
 
 
-```{r}
+
+```{r making sure panel works}
 # Ensure 'city' is a factor with consistent levels
 panel <- panel %>% 
   mutate(city = factor(city)) %>%
@@ -131,48 +164,145 @@ cities <- panel %>%
   distinct(city) %>% 
   pull(city) %>% 
   as.character()
+```
 
-# Run OLS for each city with correctly named models
-rent_models <- panel %>%
+
+
+## Basic OLS for cities
+
+```{r basic ols rates}
+# Run OLS for each city 
+rent_rates_models <- panel %>%
   group_split(city) %>%
   setNames(cities) %>%
-  map(~ lm(Rent ~ war + CPI + interest_rate, data = .x))
+  map(~ lm(Rent_rate ~ war + CPI_rate + interest_rate, data = .x))
+#screenreg(rent_rates_models)
 
-# Create model summary table
-rent_city <- modelsummary(
-  rent_models,
-  title = "OLS: Rent Regressions by City",
+```
+
+## TWFE
+
+```{r TWFE rates}
+twfe_rates_model <- feols(
+  Rent_rate ~ i(city, war, ref = "Tbilisi") + CPI_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+# screenreg(list(twfe_model, twfe_rates_model))
+```
+
+
+# VISUALS AND OUTPUT
+
+## OLS Nationwide
+```{r saving basic ols nationwide}
+models <- list("Model 1" = m1, "Model 2" = m2, "Model 3" = m3)
+vcovs  <- lapply(models, NeweyWest, prewhite = FALSE)
+
+# Save the table to a variable
+rent_table <- modelsummary(
+  models,
+  vcov = vcovs,
+  output = "gt",
+  title = "OLS with Newey-West Standard Errors",
   stars = TRUE,
   fmt = "%.2f",
   coef_rename = c(
     "war" = "War",
-    "CPI" = "Inflation",
+    "total_cpi" = "CPI",
+    "interest_rate" = "Interest Rate"
+  ),
+  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance"
+)
+
+# Save as image
+gtsave(rent_table, "C:/r/data/final_dataset/final_region/rent_ols_nation.png")
+
+
+models_rates <- list("Model 4" = m4, "Model 5" = m5, "Model 6" = m6)
+vcovs  <- lapply(models_rates, NeweyWest, prewhite = FALSE)
+
+# Save the table to a variable
+rent_rate_table <- modelsummary(
+  models_rates,
+  vcov = vcovs,
+  output = "gt",
+  title = "OLS with Newey-West Standard Errors",
+  stars = TRUE,
+  fmt = "%.2f",
+  coef_rename = c(
+    "war" = "War",
+    "total_cpi" = "CPI",
+    "interest_rate" = "Interest Rate"
+  ),
+  gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance"
+)
+
+gtsave(rent_rate_table, "C:/r/data/final_dataset/final_region/rent_rate_ols_nation.png")
+
+```
+
+
+
+## Basic OLS: cities
+
+```{r rate}
+# Basic OLS: Rent Rates by City
+models_city_rates <- rent_rates_models
+vcovs_city_rates  <- lapply(models_city_rates, NeweyWest, prewhite = FALSE)
+
+rent_rates_city <- modelsummary(
+  models_city_rates,
+  vcov = vcovs_city_rates,
+  title = "OLS: Rent Rate Regressions by City (Newey-West SEs)",
+  stars = TRUE,
+  fmt = "%.2f",
+  coef_rename = c(
+    "war" = "War",
+    "CPI_rate" = "Inflation",
     "interest_rate" = "Interest Rate"
   ),
   gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Sigma|DF|Deviance",
   output = "gt"
 )
 
-# Save the output table
-gtsave(rent_city, "C:/r/data/final_dataset/final_region/rent_city.png")
-
+gtsave(rent_rates_city, "C:/r/data/final_dataset/final_region/rent_rate_city.png")
 
 ```
 
 
+## Parallel trends
+
+```{r parallel trends}
+
+# Filter data for pre-war period
+prewar_data <- panel %>%
+  filter(date >= as.Date("2018-01-01") & date <= as.Date("2022-03-31"))
+
+# Plot raw Rent index by city
+parallel_trends <- ggplot(prewar_data, aes(x = date, y = Rent, color = city)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Parallel Trends Check: Rent Index by City (Jan 2021 – Mar 2022)",
+    x = "Date",
+    y = "Rent Index",
+    color = "City"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("C:/r/data/final_dataset/final_region/parallel_trends.png", plot = parallel_trends, width = 8, height = 6, dpi = 300)
+
+
+parallel_trends
+```
+
+
+## TWFE
+
 ```{r}
-
-
-# TWFE model: Rent ~ war (interacted with city) + controls | city FE + time FE
-twfe_model <- feols(
-  Rent ~ i(city, war, ref = "Tbilisi") + CPI | city + date,
-  data = panel
-)
- 
-
-
-twfe <- modelsummary(
-  twfe_model,
+twfe_rates <- modelsummary(
+  twfe_rates_model,
   output = "gt",
   title = "TWFE: Cities after April 2022 (vs. Tbilisi)",
   stars = TRUE,
@@ -187,14 +317,15 @@ twfe <- modelsummary(
   gof_omit = "AIC|BIC|Log.Lik.|F|RMSE|Std.Errors|FE|Within|^R2 Within|^R2 Within Adj",
 )
 
-gtsave(twfe, "C:/r/data/final_dataset/final_region/twfe.png")
+gtsave(twfe_rates, "C:/r/data/final_dataset/final_region/twfe_rates.png")
+
 ```
 
 
+
+## Visualizing rents and transfers
+
 ```{r}
-library(ggplot2)
-
-
 # Step 1: Create log variable
 df <- df %>%
   mutate(log_transfers_rus = log(transfers_rus))
@@ -237,18 +368,105 @@ ggsave("C:/r/data/final_dataset/final_region/rents_transfers.png", plot = rent_t
 
 ```
 
-
+# Shock Analysis
 
 ```{r}
-# Filter the panel for Tbilisi only
-tbilisi_data <- panel %>% filter(city == "Tbilisi")
 
-# Run the OLS model for Tbilisi
-tbilisi_model <- lm(Rent ~ war + CPI + interest_rate, data = tbilisi_data)
+# Add both shock periods
+df <- df %>%
+  mutate(
+    time = time_length(interval(min(date), date), unit = "months"),
+    shock_spring = as.integer(date >= as.Date("2022-04-01") & date <= as.Date("2022-06-01")),
+    shock_winter = as.integer(date >= as.Date("2022-10-01") & date <= as.Date("2023-01-01"))
+  )
 
-# Summarize the model
-summary(tbilisi_model)
+# Run model with both shocks
+model_dual_shocks <- lm(
+  rent_cpi_rate ~ time + shock_spring + shock_winter + total_cpi_rate + interest_rate,
+  data = df
+)
+
+# Show results
+screenreg(model_dual_shocks)
+
+
 
 ```
 
+
+
+## Placebo
+
+```{r}
+df <- df %>%
+  mutate(
+    shock_2019 = as.integer(date >= as.Date("2019-05-01") & date <= as.Date("2019-07-01")),
+    shock_2020 = as.integer(date >= as.Date("2020-05-01") & date <= as.Date("2020-07-01")),
+    shock_2021 = as.integer(date >= as.Date("2021-05-01") & date <= as.Date("2021-07-01")),
+    shock_2022 = as.integer(date >= as.Date("2022-05-01") & date <= as.Date("2022-07-01"))
+  )
+
+shock_compare_model <- lm(
+  rent_cpi_rate ~ time + shock_2019 + shock_2020 + shock_2021 + shock_2022 + total_cpi_rate + interest_rate,
+  data = df
+)
+
+screenreg(shock_compare_model)
+
+```
+
+
+
+
+```{r}
+# Add shock dummies to panel data
+panel <- panel %>%
+  mutate(
+    time = time_length(interval(min(date), date), unit = "months"),
+    shock_spring = as.integer(date >= as.Date("2022-05-01") & date <= as.Date("2022-07-01")),
+    shock_winter = as.integer(date >= as.Date("2022-10-01") & date <= as.Date("2022-12-01"))
+  )
+
+# Run shock model separately for each city
+shock_models_city <- panel %>%
+  group_split(city) %>%
+  setNames(unique(panel$city)) %>%
+  map(~ lm(Rent_rate ~ time + shock_spring + shock_winter + CPI_rate + interest_rate, data = .x))
+
+# Display summary
+screenreg(shock_models_city)
+
+```
+```{r}
+library(modelsummary)
+
+modelsummary(
+  shock_models_city,
+  fmt = "%.2f",
+  stars = TRUE,
+  coef_map = c(
+    "shock_spring" = "Spring Shock (May–July)",
+    "shock_winter" = "Winter Shock (Oct–Dec)",
+    "CPI_rate" = "CPI Inflation",
+    "interest_rate" = "Interest Rate"
+  ),
+  title = "City-Level Effects of War Shocks on Rent Inflation"
+)
+
+```
+
+
+```{r}
+twfe_shock_model <- feols(
+  Rent_rate ~ 
+    i(city, shock_spring, ref = "Tbilisi") + 
+    i(city, shock_winter, ref = "Tbilisi") + 
+    CPI_rate + interest_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+
+screenreg(twfe_shock_model)
+
+```
 
