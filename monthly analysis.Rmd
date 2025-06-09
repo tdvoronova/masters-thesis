@@ -1,0 +1,838 @@
+---
+title: "workit"
+author: "Tatiana Voronova"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setlocale("LC_TIME", "English")
+library(texreg)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(modelsummary)
+library(readr)
+library(lubridate)
+library(gt)
+library(purrr)
+library(fixest)
+library(patchwork)
+library(ggplot2)
+library(forecast)
+library(sandwich)
+library(lmtest)
+library(broom)
+library(stargazer)
+library(scales)
+
+```
+
+
+# SET UP AND CREATE RATES
+
+```{r set up again}
+
+setwd("C:/r/data/final_dataset/final_region")
+
+df <- read_csv("df.csv") %>% 
+  arrange(date) %>%
+  mutate(
+    war = as.integer(date >= as.Date("2022-04-01")),
+    time = time_length(interval(min(date), date), unit = "months"),
+    shock_spring = as.integer(date >= as.Date("2022-04-01") & date <= as.Date("2022-06-01")),
+    shock_winter = as.integer(date >= as.Date("2022-10-01") & date <= as.Date("2023-01-01")),
+    shock_2019 = as.integer(date >= as.Date("2019-04-01") & date <= as.Date("2019-06-01")),
+    shock_2020 = as.integer(date >= as.Date("2020-10-01") & date <= as.Date("2021-01-01")),
+    shock_2021 = as.integer(date >= as.Date("2021-04-01") & date <= as.Date("2021-06-01")),
+    shock_2022 = as.integer(date >= as.Date("2022-04-01") & date <= as.Date("2022-06-01")),
+    shock_2023 = as.integer(date >= as.Date("2023-10-01") & date <= as.Date("2023-12-01")),
+    month = factor(month(date, label = TRUE, abbr = TRUE))
+  ) %>%
+  mutate(
+    across(
+      c(rent_cpi, total_cpi,
+        Tbilisi_CPI, Kutaisi_CPI, Batumi_CPI, Gori_CPI, Telavi_CPI, Zugdidi_CPI,
+        Tbilisi_Rent, Kutaisi_Rent, Batumi_Rent, Gori_Rent, Telavi_Rent, Zugdidi_Rent),
+      ~ 100 * (. - lag(.)) / lag(.),
+      .names = "{.col}_rate"
+    )
+  ) %>%
+  filter(date > as.Date("2016-01-01") & date <= as.Date("2023-12-01"))
+
+
+```
+
+### Set Up
+
+```{r pivoting the table}
+
+panel <- df %>%
+  select(date, war, interest_rate,
+         matches("^(Tbilisi|Kutaisi|Batumi|Gori|Telavi|Zugdidi)_(CPI|Rent)(_rate)?$")) %>%
+  pivot_longer(
+    cols = -c(date, war, interest_rate),
+    names_to = c("city", "variable", "rate"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  mutate(
+    variable = ifelse(is.na(rate), variable, paste0(variable, "_rate"))
+  ) %>%
+  select(-rate) %>%
+  pivot_wider(names_from = variable, values_from = value) %>%
+  mutate(
+    city = factor(city),
+    date = as.Date(date)
+  )
+
+panel <- panel %>%
+  mutate(
+    time = time_length(interval(min(date), date), unit = "months"),
+    shock_spring = as.integer(date >= as.Date("2022-04-01") & date <= as.Date("2022-06-01")),
+    shock_winter = as.integer(date >= as.Date("2022-10-01") & date <= as.Date("2023-01-01")),
+    other_cities = factor(
+      if_else(city == "Tbilisi", "Tbilisi", "Other"),
+      levels = c("Other", "Tbilisi")  # Set "Other" as reference
+    )
+  )
+
+
+```
+
+
+```{r making sure panel works}
+cities <- panel %>%
+  pull(city) %>%
+  unique() %>%
+  sort()
+
+```
+
+
+
+
+# ANALYSIS
+
+## OLS
+
+
+```{r NATION OLS}
+
+m4 <- lm(rent_cpi_rate ~ war, data = df)
+m5 <- lm(rent_cpi_rate ~ war + total_cpi_rate, data = df)
+m6 <- lm(rent_cpi_rate ~ war + total_cpi_rate + interest_rate, data = df)
+
+#screenreg(list(m4, m5, m6))
+
+```
+
+
+
+```{r CITY OLS}
+
+# Create models and assign names manually
+models_city_rates <- map(cities, function(city_name) {
+  data_city <- filter(panel, city == city_name)
+  lm(Rent_rate ~ war + CPI_rate + interest_rate, data = data_city)
+})
+names(models_city_rates) <- cities
+
+```
+
+
+```{r tbilisi vs others: city shocks}
+
+df_tbilisi <- filter(panel, city == "Tbilisi")
+df_other   <- filter(panel, city != "Tbilisi")
+ols_tbilisi <- lm(Rent_rate ~ war + CPI_rate + interest_rate, data = df_tbilisi)
+ols_others <- lm(Rent_rate ~ war + CPI_rate + interest_rate, data = df_other)
+ols_tbilisi_shock <- lm(Rent_rate ~ time + shock_spring + shock_winter + CPI_rate + interest_rate, data = df_tbilisi)
+ols_others_shock <- lm(Rent_rate ~ time + shock_spring + shock_winter + CPI_rate + interest_rate, data = df_other)
+
+nw_se_tbilisi <- sqrt(diag(NeweyWest(ols_tbilisi, prewhite = FALSE)))
+nw_se_others  <- sqrt(diag(NeweyWest(ols_others, prewhite = FALSE)))
+nw_se_tbilisi_shock  <- sqrt(diag(NeweyWest(ols_tbilisi_shock, prewhite = FALSE)))
+nw_se_others_shock  <- sqrt(diag(NeweyWest(ols_others_shock, prewhite = FALSE)))
+
+screenreg(list(ols_tbilisi, ols_others, ols_tbilisi_shock, ols_others_shock))
+```
+
+
+
+
+## TWFE
+
+```{r TWFE rates}
+twfe_rates_model <- feols(
+  Rent_rate ~ i(city, war, ref = "Tbilisi") + CPI_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+screenreg(twfe_rates_model)
+```
+
+```{r TBILISI VS OTHERS}
+twfe_tbilisi_vs_other <- feols(
+  Rent_rate ~ i(other_cities, war, ref = "Other") + CPI_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+
+screenreg(twfe_tbilisi_vs_other)
+```
+
+
+## Shock Analysis
+
+```{r shock nationwide}
+# Run model with both shocks
+model_dual_shocks <- lm(
+  rent_cpi_rate ~ time + shock_spring + shock_winter + total_cpi_rate + interest_rate,
+  data = df
+)
+
+screenreg(model_dual_shocks)
+
+```
+
+```{r city-specific shocks}
+
+shock_models_city <- panel %>%
+  group_split(city) %>%
+  setNames(unique(panel$city)) %>%
+  map(~ lm(Rent_rate ~ time + shock_spring + shock_winter + CPI_rate + interest_rate, data = .x))
+
+screenreg(shock_models_city)
+
+```
+
+```{r TWFE shocks}
+twfe_shock_model <- feols(
+  Rent_rate ~ 
+    i(city, shock_spring, ref = "Tbilisi") + 
+    i(city, shock_winter, ref = "Tbilisi") + 
+    CPI_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+
+screenreg(twfe_shock_model)
+```
+```{r TWFE SHOCK TBILISI VS OTHERS}
+twfe_shock_tbilisi_vs_other <- feols(
+  Rent_rate ~ 
+    i(other_cities, shock_spring, ref = "Other") + 
+    i(other_cities, shock_winter, ref = "Other") + 
+    CPI_rate | city + date,
+  cluster = ~city,
+  data = panel
+)
+
+screenreg(twfe_shock_tbilisi_vs_other)
+
+```
+
+
+# Robustness
+## Seasonality and placebo
+
+```{r seasonality checks}
+
+# for monthly rates
+season_rent_rate <- lm(rent_cpi_rate ~ month, data = df)
+season_cpi_rate <- lm(total_cpi_rate ~ month, data = df)
+
+screenreg(list(season_rent_rate, season_cpi_rate))
+
+shock_compare_model <- lm(
+  rent_cpi_rate ~ time + shock_2019 + shock_2020 + shock_2021 + shock_2022 + shock_2023 + total_cpi_rate + interest_rate,
+  data = df
+)
+
+```
+
+
+# VISUALS AND OUTPUT
+
+```{r seasonality save}
+
+
+
+# Compute Newey–West standard errors
+nw_se_rent <- sqrt(diag(NeweyWest(season_rent_rate, prewhite = FALSE)))
+
+# Save LaTeX table with Newey–West SEs (Rent only)
+stargazer(
+  season_rent_rate,
+  se = list(nw_se_rent),
+  type = "latex",
+  title = "Seasonality Check: Monthly Rent Growth Rates (Newey–West SEs)",
+  column.labels = "Rent Growth Rate",
+  dep.var.labels = "Monthly Growth Rate",
+  covariate.labels = paste("Month:", month.abb[2:12]),  # Feb–Dec, Jan is base
+  intercept.bottom = TRUE,
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  out = "seasonality_rent_inflation_rates.tex"
+)
+
+
+```
+
+
+## Visual for rent cumulative and monthly inflation rent
+
+```{r}
+
+# Plot 1: Rent index over time
+p1 <- ggplot(df, aes(x = date, y = rent_cpi)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(
+    title = "",
+    x = "Date",
+    y = "Rent CPI Index"
+  ) +
+  theme_minimal()
+
+# Plot 2: Monthly rent inflation (% change)
+p2 <- ggplot(df, aes(x = date, y = rent_cpi_rate)) +
+  geom_line(color = "firebrick", size = 1) +
+  geom_vline(xintercept = as.Date("2022-03-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-05-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-10-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2023-01-01"), linetype = "dashed", color = "black") +
+  labs(
+    title = "",
+    x = "",
+    y = "Monthly Rent Growth Rate (%)"
+  ) +
+  theme_minimal()
+
+p1
+p2
+
+
+# Save Plot 1
+ggsave("p1.png", plot = p1, width = 8, height = 5, dpi = 300)
+
+# Save Plot 2
+ggsave("p2.png", plot = p2, width = 8, height = 5, dpi = 300)
+
+```
+
+## Basic OLS: cities
+
+```{r rate}
+# Get city names from model list names
+
+
+vcovs_city_rates <- lapply(models_city_rates, NeweyWest, prewhite = FALSE)
+
+stargazer(
+  models_city_rates,
+  type = "latex",
+  title = "OLS: Rent Rate Regressions by City (Newey–West SEs)",
+  se = vcovs_city_rates,
+  covariate.labels = c("War", "Inflation Rate", "Interest Rate"),
+  column.labels = names(models_city_rates),
+  column.separate = rep(1, length(models_city_rates)),
+  dep.var.labels = "Rent Growth Rate",
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  out = "rent_rate_city.tex"
+)
+```
+
+
+## Parallel trends
+
+```{r parallel trends}
+
+# Filter data for pre-war period
+prewar_data <- panel %>%
+  filter(date >= as.Date("2021-01-01") & date <= as.Date("2022-02-01"))
+parallel_trends <- ggplot(prewar_data, aes(x = date, y = Rent_rate)) +
+  geom_line(color = "steelblue", size = 0.6) +
+  facet_wrap(~ city, ncol = 3) +  # 3 columns, 6 cities = 2 rows
+  labs(
+    title = "",
+    x = "Date",
+    y = "Rent Growth Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),  # bold city labels
+    panel.spacing = unit(1, "lines"),           # spacing between plots
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+parallel_trends
+ggsave("C:/r/data/final_dataset/final_region/parallel_trends.png", plot = parallel_trends_2, width = 8, height = 6, dpi = 300)
+
+```
+
+## TWFE
+
+```{r}
+etable(
+  twfe_rates_model,
+  dict = c("city::Batumi:war" = "Batumi vs. Tbilisi",
+           "city::Gori:war" = "Gori vs. Tbilisi",
+           "city::Kutaisi:war" = "Kutaisi vs. Tbilisi",
+           "city::Telavi:war" = "Telavi vs. Tbilisi",
+           "city::Zugdidi:war" = "Zugdidi vs. Tbilisi",
+           "CPI_rate" = "Inflation Rate"),
+  tex = TRUE,  #
+  file = "C:/r/data/final_dataset/final_region/twfe_rates.tex"
+)
+
+```
+
+
+## Visualizing rents and transfers
+
+
+```{r visual for rents and transfers}
+# Step 1: Create log variable
+df <- df %>%
+  mutate(log_transfers_rus = log(transfers_rus))
+
+# Step 2: Get scaling parameters
+range_rent <- range(df$rent_cpi, na.rm = TRUE)
+range_log <- range(df$log_transfers_rus, na.rm = TRUE)
+
+# Manual scaling
+scale_factor <- diff(range_rent) / diff(range_log)
+offset <- range_rent[1] - range_log[1] * scale_factor
+
+# Step 3: Plot
+rent_transfers <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = rent_cpi, color = "Rent CPI"), size = 1) +
+  geom_line(aes(y = log_transfers_rus * scale_factor + offset, color = "Log(Transfers from Russia)"), 
+            size = 1, linetype = "dashed") +
+  scale_y_continuous(
+    name = "Rent CPI",
+    sec.axis = sec_axis(
+      trans = ~ (. - offset) / scale_factor,
+      name = "Log(Transfers from Russia)"
+    )
+  ) +
+  scale_color_manual(values = c("Rent CPI" = "blue", "Log(Transfers from Russia)" = "red")) +
+  labs(
+    title = "",
+    x = "Date",
+    color = "Variable"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.y.left = element_text(color = "blue"),
+    axis.title.y.right = element_text(color = "red")
+  )
+
+
+ggsave("C:/r/data/final_dataset/final_region/rents_transfers.png", plot = rent_transfers, width = 8, height = 6, dpi = 300)
+
+```
+
+
+```{r money tranfers}
+
+# Filter data from 2019 onward
+df_filtered <- df %>% 
+  filter(date >= as.Date("2019-01-01"))
+
+# Base plot with vertical dashed lines
+p <- ggplot(df_filtered, aes(x = date, y = transfers_rus)) +
+  geom_line(color = "black", size = 1) +
+  
+  # Vertical lines marking migration wave periods
+  geom_vline(xintercept = as.Date("2022-04-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-06-30"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2022-10-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2023-01-01"), linetype = "dashed", color = "black") +
+
+  scale_y_continuous(
+    labels = comma_format(accuracy = 1),
+    limits = c(0, NA)
+  ) +
+  
+  labs(
+    title = "Money Transfers from Russia (2019–2023)",
+    x = "Date",
+    y = "Transfers (Thousand USD)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(angle = 0)
+  )
+
+
+# Save the plot
+ggsave("money_transfers.png", plot = p, width = 8, height = 5, dpi = 300)
+
+```
+
+
+### saving city-specific shocks
+```{r}
+# Newey–West SEs for each city-specific shock model
+se_shock_models_city <- lapply(shock_models_city, function(model) {
+  sqrt(diag(NeweyWest(model, prewhite = FALSE)))
+})
+# Extract city names
+shock_city_names <- names(shock_models_city)
+
+# Stargazer table
+stargazer(
+  shock_models_city,
+  type = "latex",
+  title = "OLS: City-Level Effects of War Shocks on Rent Inflation (Newey–West SEs)",
+  se = se_shock_models_city,
+  covariate.labels = c("Time", "Spring Shock", "Winter Shock", "Inflation Rate", "Interest Rate"),
+  column.labels = shock_city_names,
+  column.separate = rep(1, length(shock_models_city)),
+  dep.var.labels = "Rent Growth Rate",
+  intercept.bottom = TRUE,
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  out = "shock_city_rent.tex"
+)
+
+```
+
+
+### twfe shock model and save
+```{r twfe shock}
+
+# Save etable for TWFE shock model to LaTeX
+fixest::etable(
+  twfe_shock_model,
+  tex = TRUE,
+  file = "C:/r/data/final_dataset/final_region/twfe_shock_model.tex",
+  title = "TWFE: Shock Effects on Rent Growth (vs. Tbilisi)",
+  dict = c(
+    "city::Batumi:shock_spring"  = "Batumi – Spring Shock",
+    "city::Gori:shock_spring"    = "Gori – Spring Shock",
+    "city::Kutaisi:shock_spring" = "Kutaisi – Spring Shock",
+    "city::Telavi:shock_spring"  = "Telavi – Spring Shock",
+    "city::Zugdidi:shock_spring" = "Zugdidi – Spring Shock",
+    "city::Batumi:shock_winter"  = "Batumi – Winter Shock",
+    "city::Gori:shock_winter"    = "Gori – Winter Shock",
+    "city::Kutaisi:shock_winter" = "Kutaisi – Winter Shock",
+    "city::Telavi:shock_winter"  = "Telavi – Winter Shock",
+    "city::Zugdidi:shock_winter" = "Zugdidi – Winter Shock",
+    "CPI_rate"                   = "Inflation Rate"
+  )
+)
+
+```
+
+
+## Placebo save
+```{r}
+
+
+## 1. One-model list ------------------------------------------------------
+models_placebo <- list(shock_compare_model)
+
+## 2. Newey-West SE vector -----------------------------------------------
+nw_se_placebo <- list(sqrt(diag(NeweyWest(shock_compare_model, prewhite = FALSE))))
+
+## 3. Stargazer -----------------------------------------------------------
+stargazer(
+  models_placebo,
+  type  = "latex",
+  se    = nw_se_placebo,
+  float = FALSE,
+  title = "Placebo Model: Rent Growth During Random Shock Periods (Newey–West SEs)",
+  label = "tab:placebo_rent",                 # reference name
+  dep.var.labels = "Rent Growth Rate",
+
+  # keep coefficients in the order you want
+  order = c("time",
+            "shock_2019","shock_2020","shock_2021",
+            "shock_2022","shock_2023",
+            "total_cpi_rate","interest_rate"),
+
+  covariate.labels = c("Time",
+                       "Shock 2019 (Mar–May)",
+                       "Shock 2020 (Oct–Jan)",
+                       "Shock 2021 (Mar–May)",
+                       "Shock 2022 (Mar–May)",
+                       "Shock 2023 (Oct–Dec)",
+                       "Inflation Rate","Interest Rate"),
+
+  intercept.bottom = TRUE,                    # constant stays last
+  omit.stat        = c("aic","bic","ll","f","ser"),
+  star.cutoffs     = c(.05,.01,.001),
+  digits           = 2,
+  out              = "placebo_model_nw.tex"    # write the file
+)
+
+```
+
+
+
+## OLS Nationwide
+```{r saving basic ols nationwide}
+
+## 1. models 
+models_rates <- list(m4, m5, m6)
+
+## 2. Newey-West SE vectors 
+nw_se <- lapply(models_rates, \(m) sqrt(diag(NeweyWest(m, prewhite = FALSE))))
+
+stargazer(
+  models_rates,
+  type  = "latex",
+  se    = nw_se,
+  float = FALSE,
+  title = "OLS Results: Monthly Rent Growth and the War, Nationwide (Newey-West SEs)",
+  dep.var.labels = "Rent Growth Rate",
+
+  ## tell stargazer which coefficients (and in what order) to print
+  order            = c("war", "total_cpi_rate", "interest_rate"),
+
+  ## now give exactly the same number of labels
+  covariate.labels = c("War", "Inflation Rate", "Interest Rate"),
+
+  intercept.bottom = TRUE,          # constant stays at the bottom
+  omit.stat        = c("aic","bic","ll","f","ser"),
+  star.cutoffs     = c(.05,.01,.001),
+  digits           = 2,
+  out              = "rent_rate_ols_nation.tex"
+)
+
+
+```
+
+```{r nation shock}
+stargazer(
+  model_dual_shocks,
+  type   = "latex",
+  se     = list(sqrt(diag(NeweyWest(model_dual_shocks, prewhite = FALSE)))),
+  float  = FALSE,
+  title  = "Nationwide Rent Growth: Spring- and Winter-Shock Effects (Newey–West SEs)",
+  label  = "tab:nation_shock",
+  digits = 2,
+  out    = "nation_shock.tex",
+
+  # Rename independent variables
+  covariate.labels = c(
+    "Time",
+    "Spring Shock",
+    "Winter Shock",
+    "Inflation",
+    "Interest Rate"
+  ),
+  order = c("time", "shock_spring", "shock_winter", "total_cpi_rate", "interest_rate"),
+
+  # Rename dependent variable
+  dep.var.labels = "Rent",
+
+  intercept.bottom = TRUE,
+  omit.stat        = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs     = c(0.05, 0.01, 0.001)
+)
+
+
+```
+
+```{r}
+# 1. List of all models: baseline + shock model
+models_all <- list(m4, m5, m6, model_dual_shocks)
+
+# 2. List of Newey-West SEs for each model
+se_all <- lapply(models_all, \(m) sqrt(diag(sandwich::NeweyWest(m, prewhite = FALSE))))
+
+# 3. Stargazer combined output
+stargazer(
+  models_all,
+  type  = "latex",
+  se    = se_all,
+  title = "OLS Results: Rent Growth, War and Migration Shocks (Newey–West SEs)",
+  dep.var.labels = "Rent Growth Rate",
+
+  # Order of coefficients
+  order = c("war", "total_cpi_rate", "interest_rate", "time", "shock_spring", "shock_winter"),
+
+  # Labels for coefficients
+  covariate.labels = c(
+    "War",
+    "Inflation Rate",
+    "Interest Rate",
+    "Time",
+    "Spring Shock",
+    "Winter Shock"
+  ),
+
+  intercept.bottom = TRUE,
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  out = "combined_rent_ols.tex"
+)
+
+```
+# Saving Tbilisi vs Others
+
+
+```{r ols and shocks}
+stargazer(
+  list(ols_tbilisi, ols_others, ols_tbilisi_shock, ols_others_shock),
+  type  = "latex",
+  title = "OLS: Rent Growth – Tbilisi vs. Other Cities (War and Shock Effects)",
+  se    = list(nw_se_tbilisi, nw_se_others, nw_se_tbilisi_shock, nw_se_others_shock),
+  dep.var.labels = "Rent Growth Rate",
+  column.labels  = c("Tbilisi – War", "Other – War", "Tbilisi – Shocks", "Other – Shocks"),
+  covariate.labels = c(
+    "War",
+    "Inflation Rate",
+    "Interest Rate",
+    "Time",
+    "Spring Shock",
+    "Winter Shock"
+  ),
+  order = c("war", "spring_shock", "winter_shock", "CPI_rate", "interest_rate"),
+  intercept.bottom = TRUE,
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  out = "ols_tbilisi_vs_others_combined.tex"
+)
+
+```
+
+
+```{r twfe and shocks}
+
+fixest::etable(
+  list(
+    "TWFE – War"   = twfe_tbilisi_vs_other,
+    "TWFE – Shocks" = twfe_shock_tbilisi_vs_other
+  ),
+  tex = TRUE,
+  file = "C:/r/data/final_dataset/final_region/twfe_tbilisi_vs_others.tex",
+  title = "",
+  dict = c(
+    "other_cities::Tbilisi:war"          = "War",
+    "other_cities::Tbilisi:shock_spring" = "Spring Shock",
+    "other_cities::Tbilisi:shock_winter" = "Winter Shock",
+    "CPI_rate"                         = "Inflation Rate",
+    "interest_rate"                    = "Interest Rate"
+  ),
+  digits = 2
+)
+
+
+```
+
+
+
+
+
+
+
+
+
+# DW Test
+
+```{r}
+rent_rates_models <- models_city_rates
+
+
+# Define user-friendly variable names
+variable_labels <- c(
+  "war" = "War",
+  "CPI_rate" = "Inflation Rate",
+  "total_cpi_rate" = "Inflation Rate",
+  "interest_rate" = "Interest Rate"
+)
+
+# -------------------------------
+# ---- NATIONAL MODELS ----
+# -------------------------------
+
+# List your national models
+national_models <- list("Model 1" = m4, "Model 2" = m5, "Model 3" = m6)
+
+# Run Durbin–Watson tests on each model
+dw_national <- map(national_models, dwtest)
+
+# Combine model output and DW results into one tidy table
+tidy_national <- map2_df(national_models, names(national_models), ~ {
+  tidy(.x) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      term = recode(term, !!!variable_labels),
+      model = .y,
+      dw_statistic = round(dw_national[[.y]]$statistic, 3),
+      dw_p_value = round(dw_national[[.y]]$p.value, 3)
+    )
+}, .id = "model_id")
+
+# Build and save national-level GT table
+national_table <- tidy_national %>%
+  select(model, term, estimate, std.error, p.value, dw_statistic, dw_p_value) %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  gt() %>%
+  cols_label(
+    model = "Model",
+    term = "Variable",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    p.value = "P-Value",
+    dw_statistic = "DW Statistic",
+    dw_p_value = "DW P-Value"
+  ) %>%
+  tab_header(
+    title = ""
+  )
+
+gtsave(national_table, "C:/r/data/final_dataset/final_region/dw_rents_nation.png")
+
+# ----------------------------
+# ---- CITY-LEVEL MODELS ----
+# ----------------------------
+
+# List of city-level models (must be named!)
+# Example: rent_rates_models <- list(Batumi = model1, Tbilisi = model2, ...)
+dw_city <- map(rent_rates_models, dwtest)
+
+# Tidy city models and attach DW stats
+tidy_city <- map_df(rent_rates_models, tidy, .id = "city") %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term, !!!variable_labels),
+    dw_statistic = map_dbl(city, ~ round(dw_city[[.x]]$statistic, 3)),
+    dw_p_value = map_dbl(city, ~ round(dw_city[[.x]]$p.value, 3))
+  )
+
+# Build and save city-level GT table
+city_table <- tidy_city %>%
+  select(city, term, estimate, std.error, p.value, dw_statistic, dw_p_value) %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  gt() %>%
+  cols_label(
+    city = "City",
+    term = "Variable",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    p.value = "P-Value",
+    dw_statistic = "DW Statistic",
+    dw_p_value = "DW P-Value"
+  ) %>%
+  tab_header(
+    title = ""
+  )
+
+gtsave(city_table, "C:/r/data/final_dataset/final_region/city_dw_table.png")
+
+```

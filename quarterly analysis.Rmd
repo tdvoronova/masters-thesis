@@ -1,0 +1,278 @@
+---
+title: "Rent and Wage Growth Analysis"
+author: "Tatiana Voronova"
+date: "2025-05-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(zoo)
+library(fixest)
+library(gt)
+library(texreg)
+library(stargazer)
+library(modelsummary)
+library(kableExtra)
+library(sandwich)
+library(lmtest)
+```
+
+
+```{r set up}
+setwd("C:/r/data/final_dataset/final_region")
+
+# Load and format city-level data
+wages <- read.csv("wages.csv")
+rents <- read.csv("rents.csv")
+wages$Date <- seq(as.Date("2012-01-01"), as.Date("2024-12-01"), by = "3 months")
+rents$Date <- seq(as.Date("2012-01-01"), as.Date("2024-12-01"), by = "month")
+rents$Quarter <- floor_date(rents$Date, "quarter")
+
+# Aggregate rents to quarterly
+rents_quarterly <- rents %>%
+  group_by(Quarter) %>%
+  summarise(across(-Date, mean, na.rm = TRUE)) %>%
+  rename(Date = Quarter)
+
+# Merge and reshape
+panel <- merge(wages, rents_quarterly, by = "Date") %>%
+  pivot_longer(cols = -Date, 
+               names_to = c("City", "Variable"), 
+               names_sep = "_", 
+               values_to = "Value") %>%
+  pivot_wider(names_from = Variable, values_from = Value) %>%
+  arrange(City, Date) %>%
+  group_by(City) %>%
+  mutate(
+    RealWage = Wage / CPI * 100,
+    inflation_rate = 100 * (CPI - lag(CPI)) / lag(CPI),
+    RentGrowth = 100 * (Rent - lag(Rent)) / lag(Rent),
+    RealWageGrowth = 100 * (RealWage - lag(RealWage)) / lag(RealWage),
+    AffordabilityGap = RealWageGrowth - RentGrowth,
+    war = if_else(Date >= as.Date("2022-04-01"), 1, 0),
+    InvasionPeriod = if_else(Date >= as.Date("2022-04-01"), "Post", "Pre")
+  ) %>%
+  ungroup() %>%
+  filter(Date > as.Date("2015-10-01") & Date < as.Date("2024-01-01"))
+
+# Load and process nationwide data
+nationwide <- read.csv("nationwide_rents_wages.csv") %>%
+  mutate(
+    CPI = inflation,
+    RealWage = wages / CPI * 100,
+    inflation_rate = 100 * (inflation - lag(CPI)) / lag(CPI),
+    RentGrowth = 100 * (rent - lag(rent)) / lag(rent),
+    RealWageGrowth = 100 * (RealWage - lag(RealWage)) / lag(RealWage),
+    AffordabilityGap = RealWageGrowth - RentGrowth,
+    war = if_else(quarter_start >= as.Date("2022-04-01"), 1, 0),
+    InvasionPeriod = if_else(quarter_start >= as.Date("2022-04-01"), "Post", "Pre")
+  ) %>%
+  filter(quarter_start >= as.Date("2016-01-01") & quarter_start <= as.Date("2023-12-31"))
+
+```
+
+```{r affordability gap}
+# Summary: city-level
+growth_summary <- panel %>%
+  group_by(City, InvasionPeriod) %>%
+  summarise(AvgGap = mean(AffordabilityGap, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = InvasionPeriod, values_from = AvgGap) %>%
+  rename(`Gap (Pre)` = Pre, `Gap (Post)` = Post) %>%
+  mutate(`Δ Gap` = `Gap (Post)` - `Gap (Pre)`) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+# Summary: nationwide
+nationwide_summary <- nationwide %>%
+  group_by(InvasionPeriod) %>%
+  summarise(AvgGap = mean(AffordabilityGap, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = InvasionPeriod, values_from = AvgGap) %>%
+  mutate(City = "Nationwide", `Δ Gap` = Post - Pre) %>%
+  rename(`Gap (Pre)` = Pre, `Gap (Post)` = Post) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+# Combine and save
+growth_summary <- bind_rows(growth_summary, nationwide_summary)
+
+growth_summary %>%
+  gt() %>%
+  tab_header(title = "Affordability Gap Before and After War") %>%
+  gtsave("C:/r/data/final_dataset/final_region/growth_affordability_summary.png")
+
+growth_summary %>%
+  kbl(format = "latex", booktabs = TRUE, caption = "Affordability Gap Before and After War") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  save_kable("growth_affordability_summary.tex")
+
+```
+
+```{r ols models}
+wage_models <- list()
+nw_se_list <- list()
+
+# City-level OLS models using Real Wage Growth
+for (city in unique(panel$City)) {
+  city_data <- filter(panel, City == city)
+  model <- lm(RealWageGrowth ~ war, data = city_data)
+  wage_models[[city]] <- model
+  nw_se_list[[city]] <- sqrt(diag(NeweyWest(model, prewhite = FALSE)))
+}
+
+# Nationwide model still uses inflation control
+nw_model <- lm(RealWageGrowth ~ war, data = nationwide)
+wage_models[["Nationwide"]] <- nw_model
+nw_se_list[["Nationwide"]] <- sqrt(diag(NeweyWest(nw_model, prewhite = FALSE)))
+
+
+# Combine SEs in correct order
+nw_se_values <- lapply(names(wage_models), function(name) nw_se_list[[name]])
+
+stargazer(
+  wage_models,
+  se = nw_se_values,
+  type = "latex",
+  title = "OLS: Real Wage Growth by City and Nationwide (Newey–West SEs)",
+  float = FALSE,
+  dep.var.labels = "Real Wage Growth Rate",
+  covariate.labels = c("War"),
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  digits = 2,
+  column.labels = names(wage_models),
+  out = "wage_growth_by_city.tex"
+)
+
+```
+
+```{r seasonality}
+# Add quarter variable
+panel <- panel %>%
+  mutate(QuarterNum = quarter(Date),
+         QuarterFactor = factor(QuarterNum))
+
+# Run seasonality model
+seasonality_model <- lm(RealWageGrowth ~ QuarterFactor, data = panel)
+nw_se <- sqrt(diag(NeweyWest(seasonality_model, prewhite = FALSE)))
+
+stargazer(
+  seasonality_model,
+  se = list(nw_se),
+  type = "latex",
+  title = "Seasonality Check: Real Wage Growth by Quarter (Newey–West SEs)",
+  dep.var.labels = "Real Wage Growth Rate",
+  covariate.labels = c("Q2", "Q3", "Q4"),
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  digits = 2,
+  out = "seasonality_wage_growth.tex"
+)
+
+```
+
+
+```{r dw test}
+# DW Test and tidy output
+wage_labels <- c("war" = "War")
+dw_wage <- map(wage_models, dwtest)
+
+tidy_wage_dw <- map_df(wage_models, tidy, .id = "City") %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term, !!!wage_labels),
+    dw_statistic = map_dbl(City, ~ round(dw_wage[[.x]]$statistic, 3)),
+    dw_p_value   = map_dbl(City, ~ round(dw_wage[[.x]]$p.value, 3))
+  )
+
+# Save Durbin-Watson results
+wage_dw_table <- tidy_wage_dw %>%
+  select(City, term, estimate, std.error, p.value, dw_statistic, dw_p_value) %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  gt() %>%
+  cols_label(
+    City         = "City",
+    term         = "Variable",
+    estimate     = "Estimate",
+    std.error    = "Std. Error",
+    p.value      = "P-Value",
+    dw_statistic = "DW Statistic",
+    dw_p_value   = "DW P-Value"
+  )
+
+gtsave(wage_dw_table, "C:/r/data/final_dataset/final_region/wage_dw_table.png")
+
+```
+
+
+
+# Tbilisi vs Others
+
+```{r}
+# Split data
+df_tbilisi <- filter(panel, City == "Tbilisi")
+df_others  <- filter(panel, City != "Tbilisi")
+
+# --- Baseline models: Real Wage Growth ~ War ---
+ols_tbilisi <- lm(RealWageGrowth ~ war, data = df_tbilisi)
+ols_others  <- lm(RealWageGrowth ~ war, data = df_others)
+
+# --- Affordability Gap models: AffordabilityGap ~ War ---
+gap_tbilisi <- lm(AffordabilityGap ~ war, data = df_tbilisi)
+gap_others  <- lm(AffordabilityGap ~ war, data = df_others)
+
+# --- Newey-West standard errors ---
+nw_ols_tbilisi <- sqrt(diag(NeweyWest(ols_tbilisi, prewhite = FALSE)))
+nw_ols_others  <- sqrt(diag(NeweyWest(ols_others, prewhite = FALSE)))
+nw_gap_tbilisi <- sqrt(diag(NeweyWest(gap_tbilisi, prewhite = FALSE)))
+nw_gap_others  <- sqrt(diag(NeweyWest(gap_others, prewhite = FALSE)))
+
+```
+
+
+```{r}
+stargazer(
+  list(ols_tbilisi, ols_others, gap_tbilisi, gap_others),
+  se = list(nw_ols_tbilisi, nw_ols_others, nw_gap_tbilisi, nw_gap_others),
+  type = "latex",
+  title = "",
+  column.labels = c("Tbilisi – Wage", "Others – Wage", "Tbilisi – Gap", "Others – Gap"),
+  dep.var.labels = c("Real Wage Growth", "Affordability Gap"),
+  covariate.labels = c("War"),
+  digits = 2,
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  intercept.bottom = TRUE,
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  out = "wage_tbilisi_vs_others.tex"
+)
+
+```
+
+```{r per city affordability}
+gap_models <- list()
+gap_nw_se_list <- list()
+
+for (city in unique(panel$City)) {
+  city_data <- filter(panel, City == city)
+  model <- lm(AffordabilityGap ~ war, data = city_data)
+  gap_models[[city]] <- model
+  gap_nw_se_list[[city]] <- sqrt(diag(NeweyWest(model, prewhite = FALSE)))
+}
+stargazer(
+  gap_models,
+  se = gap_nw_se_list,
+  type = "latex",
+  title = "OLS: Affordability Gap by City (Newey–West SEs)",
+  dep.var.labels = "Affordability Gap",
+  covariate.labels = c("War"),
+  omit.stat = c("aic", "bic", "ll", "f", "ser"),
+  digits = 2,
+  column.labels = names(gap_models),
+  out = "affordability_by_city.tex"
+)
+
+
+```
+
+
